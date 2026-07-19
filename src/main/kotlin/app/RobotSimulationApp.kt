@@ -84,7 +84,7 @@ class RobotSimulationApp : Application() {
 
     private fun installKeyboardControls(scene: Scene) {
         val speed = 120.0
-        val turn = 90.0
+        val turn = 60.0
         // addEventFilter (capture phase) fires before any focused node can consume the event,
         // which matters because buttons consume SPACE and arrow keys for focus navigation.
         scene.addEventFilter(KeyEvent.KEY_PRESSED) { e ->

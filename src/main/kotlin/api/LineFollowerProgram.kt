@@ -16,8 +16,13 @@ class LineFollowerProgram : RobotProgram {
     private var lineRight  = false
 
     // Remembers the last turn direction so the robot can search for the line after losing it.
-    // -1 = last turned left, 0 = was going straight, 1 = last turned right
+    // -1 = last turned left, 0 = uninitialised, 1 = last turned right
     private var lastTurnDir = 0
+
+    // When lastTurnDir is unknown the robot sweeps clockwise then counter-clockwise
+    // until it finds the line, avoiding the "creep into a wall" failure.
+    private var sweepDir   = 1.0   // +1 = clockwise, -1 = counter-clockwise
+    private var sweepTicks = 0
 
     private var hasEverFoundLine = false
     private var lostLineTicks    = 0
@@ -31,6 +36,8 @@ class LineFollowerProgram : RobotProgram {
     override fun startProgram(robot: RobotApi) {
         api = robot
         lastTurnDir      = 0
+        sweepDir         = 1.0
+        sweepTicks       = 0
         hasEverFoundLine = false
         lostLineTicks    = 0
         stopped          = false
@@ -70,6 +77,8 @@ class LineFollowerProgram : RobotProgram {
         // Track which side sensor fires even while center is active — catches corners.
         if (lineLeft && !lineRight) lastTurnDir = -1
         if (!lineLeft && lineRight) lastTurnDir = 1
+        // Reset sweep state whenever the line is visible.
+        if (lineLeft || lineCenter || lineRight) { sweepTicks = 0; sweepDir = 1.0 }
 
         val (l, r) = when {
             lineCenter              -> speed to speed
@@ -78,7 +87,12 @@ class LineFollowerProgram : RobotProgram {
             else                    -> when (lastTurnDir) {
                 -1   -> searchSpin to -searchSpin
                  1   -> -searchSpin to searchSpin
-                else -> speed * 0.4 to speed * 0.4
+                else -> {
+                    // lastTurnDir unknown (first straight segment): sweep clockwise then
+                    // counter-clockwise in 75-tick phases until a corner is found.
+                    if (++sweepTicks > 75) { sweepDir = -sweepDir; sweepTicks = 0 }
+                    -searchSpin * sweepDir to searchSpin * sweepDir
+                }
             }
         }
         api.perform(SetVelocityCommand(api.actuator, l, r))
