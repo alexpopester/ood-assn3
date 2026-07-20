@@ -11,141 +11,251 @@ import kotlin.math.sin
 import observer.Observer
 
 /**
- * Finds the red ball in the obstacle course.
+ * Finds and touches the red ball in the obstacle course.
  *
- * The vision sensor is a single forward-facing ray, so the ball is only "spotted" when the robot is
- * pointed at it with a clear line of sight. The strategy is therefore a mostly-driving explorer that
- * keeps the vision ray sweeping across new ground:
+ * The vision sensor is a single forward-facing ray, so the ball is only "seen" when the robot is
+ * pointed at it with a clear line of sight. The explorer is a robust **bump-and-turn** roamer:
  *
- *  1. **Explore** — CRUISE forward, and when an obstacle or wall looms (sonar) or is hit (collision),
- *     turn away (AVOID / BACKUP) toward whichever side is *less explored*. To decide "less explored"
- *     the program keeps its own dead-reckoning [odometry] and marks a coarse [visited] grid, biasing
- *     the robot into fresh territory. Because it is nearly always translating, it covers the arena
- *     quickly, and the forward ray naturally scans across the ball as the robot roams and turns.
+ *  1. **DRIVE** — cruise forward. Watch vision every tick (red ⇒ HOME). Use sonar to turn away from
+ *     obstacles *before* hitting them (AVOID). Every so often, pause to look around (SCAN).
+ *  2. **AVOID** — an obstacle/wall is close: arc away toward whichever side has been *less visited*
+ *     (odometry-backed) until the way ahead is clear again, then resume driving.
+ *  3. **TURN-AWAY** — a collision slipped past the sonar (the single ray can thread a gap the wider
+ *     robot body cannot). Rotate a committed angle toward the less-visited side and drive on. This
+ *     is the key to not getting pinned on a corner — we never re-drive into the same clip.
+ *  4. **SCAN** — spin a full turn in place, sweeping the vision ray across everything around us to
+ *     catch the ball from this vantage point; red ⇒ HOME, otherwise carry on.
+ *  5. **HOME** — line of sight is clear, so drive straight at the ball. Because the ball is not solid,
+ *     a long "locked-on" run of red frames means we closed the distance and drove through it (touched
+ *     it) when red finally drops — so we stop.
  *
- *  2. **Home in** — vision is checked every tick; the instant it reports red, line of sight is clear,
- *     so the robot drives straight at the ball until it arrives (with a small sidestep if it clips an
- *     obstacle corner on the way in).
- *
- * It subscribes to a single sensor (sonar) as its control-loop clock — [react] must run exactly once
- * per tick for the odometry to stay in step with the simulation — and reads the rest via `.reading`.
+ * All thresholds are physical (distance / angle / time), never tick counts. It clocks off the
+ * collision sensor — the last sensor updated each tick — so sonar, vision and collision are all fresh.
+ * A light dead-reckoning [odometry] estimate backs the "less visited" bias and the arrival test; it
+ * advances by [dtPerTick], the simulation's fixed timestep (the app runs a fixed-timestep loop, so
+ * every react corresponds to exactly one physics step of this size — no wall-clock guessing needed).
  */
 class BallFinderProgram(
-    // Wall-clock source for the per-tick timestep. Defaults to the real clock; a headless test can
-    // inject a virtual clock to run the simulation deterministically and faster than real time.
-    private val clockNanos: () -> Long = System::nanoTime,
+    private val dtPerTick: Double = 1.0 / 60.0,
 ) : RobotProgram {
     override val name = "Ball Finder"
 
-    // Mirror model.Robot so the internal odometry matches the simulator's motion.
-    private val trackWidth = 26.0
+    private val trackWidth = 26.0    // mirror model.Robot so odometry matches the simulator
 
-    private val cruiseSpeed = 130.0    // forward drive speed (max track speed is 150)
-    private val spinSpeed   = 65.0     // in-place turn speed for avoidance
+    private val cruise    = 140.0    // forward drive speed (near the 150 track-speed cap)
+    private val spin      = 100.0    // in-place turn speed for scanning / turning away
+    private val avoidDist = 78.0     // sonar ahead this close → arc away
+    private val clearDist = 135.0    // sonar ahead this open → done avoiding, drive again
+    private val turnAway  = 1.4      // radians to rotate after a collision (~80°)
+    private val bigTurn   = 2.4      // radians for the stuck-escape turn (~140°)
+    private val backupTime = 0.32    // seconds to reverse (to unpin) before turning away
+    private val scanEvery = 330.0    // odometry distance driven between look-around scans (vision is
+                                     // also checked every tick while driving, so scans are just a bonus)
+    private val arriveDist = 55.0    // distance to close while locked on red before "touched" counts
+    private val stuckTime = 2.5      // seconds without net progress → reverse clear and change tack
+    private val cellSize  = 90.0     // visited-grid resolution (odometry units)
 
-    private val avoidDist = 62.0       // sonar distance ahead that triggers an avoidance turn
-    private val clearDist = 120.0      // sonar distance ahead that counts as clear again
-    private val cellSize  = 80.0       // visited-grid resolution, in odometry units
+    private enum class Mode { DRIVE, AVOID, BACKUP, TURNAWAY, SCAN, HOME, DONE }
+    private var mode = Mode.SCAN
 
-    private val reorientEvery = 200   // ticks of cruising before steering toward fresh ground
-
-    private enum class Mode { CRUISE, ORIENT, AVOID, BACKUP, HOMING }
-    private var mode = Mode.CRUISE
-
-    // --- dead-reckoning odometry (relative to the start pose) ---
+    // dead-reckoning odometry (relative to the start pose) + a coarse visited grid for coverage bias
     private var odoX = 0.0
     private var odoY = 0.0
     private var odoHeading = 0.0
-    private var lastClock = -1L
     private var lastDt = 0.0
     private val visited = HashMap<Long, Int>()
 
-    // --- manoeuvre bookkeeping ---
-    private var turnDir = 1.0          // +1 = increase heading (turn right on screen), -1 = left
-    private var cruisePhase = 0.0      // drives the cruise weave that sweeps the vision ray
-    private var cruiseTicks = 0        // cruising time since the last reorient
-    private var targetHeading = 0.0    // heading ORIENT steers toward
-    private var avoidTicks = 0
-    private var backupTicks = 0
-    private var homingLostTicks = 0
+    private var scanSweep = 0.0        // heading swept so far this SCAN
+    private var prevHeading = 0.0
+    private var turnTarget = 0.0       // heading TURNAWAY is rotating toward
+    private var avoidDir = 1.0         // +1 / -1 turn direction while avoiding
+    private var backupSecs = 0.0       // seconds spent reversing this BACKUP
+    private var backupDur = 0.32       // how long to reverse this BACKUP
+    private var pendingTurn = 1.4      // radians to turn away after the current backup finishes
+    private var scanRefX = 0.0         // where we last scanned from (drives scanEvery)
+    private var scanRefY = 0.0
 
-    // --- stuck detection: break out of local-minimum pockets ---
+    // homing: redDist = distance closed while continuously locked on red; closing a long distance then
+    // losing red means we drove through the (non-solid) ball — i.e. touched it.
+    private var redDist = 0.0
+    private var homePrevX = 0.0
+    private var homePrevY = 0.0
+    private var homeLost = 0
+
+    // stuck escape (time + net displacement, frame-rate independent)
     private var stuckRefX = 0.0
     private var stuckRefY = 0.0
-    private var stuckTicks = 0
-    private var ignoreRedTicks = 0
+    private var stuckSecs = 0.0
 
-    private lateinit var clockObs: Observer<Double>
+    private lateinit var clockObs: Observer<Boolean>
     private lateinit var api: RobotApi
 
     override fun startProgram(robot: RobotApi) {
         api = robot
-        mode = Mode.CRUISE
-        odoX = 0.0; odoY = 0.0; odoHeading = 0.0
-        lastClock = -1L; lastDt = 0.0
+        odoX = 0.0; odoY = 0.0; odoHeading = 0.0; lastDt = 0.0
         visited.clear()
-        turnDir = 1.0
-        cruisePhase = 0.0; cruiseTicks = 0; targetHeading = 0.0
-        avoidTicks = 0; backupTicks = 0; homingLostTicks = 0
-        stuckRefX = 0.0; stuckRefY = 0.0; stuckTicks = 0
-        ignoreRedTicks = 0
+        scanRefX = 0.0; scanRefY = 0.0
+        redDist = 0.0; homeLost = 0
+        stuckRefX = 0.0; stuckRefY = 0.0; stuckSecs = 0.0
+        beginScan()   // look around once before setting off
 
+        // Clock off collision — the last sensor updated each tick — so sonar & vision are already fresh.
         clockObs = Observer { react() }
-        robot.sensors.sonar.subscribe(clockObs)
+        robot.sensors.collision.subscribe(clockObs)
     }
 
     override fun stopProgram(robot: RobotApi) {
-        robot.sensors.sonar.unsubscribe(clockObs)
+        robot.sensors.collision.unsubscribe(clockObs)
         robot.perform(SetVelocityCommand(robot.actuator, 0.0, 0.0))
     }
 
     private fun react() {
+        if (mode == Mode.DONE) return
         updateOdometry()
         markVisited()
 
         val vision = api.sensors.vision.reading ?: Color.TRANSPARENT
-        val sonar = api.sensors.sonar.reading ?: Double.MAX_VALUE
-        if (ignoreRedTicks > 0) ignoreRedTicks--
+        val sonar  = api.sensors.sonar.reading ?: Double.MAX_VALUE
+        val hit    = api.sensors.collision.reading == true
 
-        // Stuck detection: barely moved for a while (a pocket, or wedged on a corner while homing) —
-        // force a strong escape: a long reverse and a turn the other way. When it fires mid-homing we
-        // briefly ignore red so the robot can pull off the obstacle and re-approach from a new angle.
-        if (hypot(odoX - stuckRefX, odoY - stuckRefY) > 70.0) {
-            stuckRefX = odoX; stuckRefY = odoY; stuckTicks = 0
-        } else if (++stuckTicks > 300) {
-            stuckTicks = 0; ignoreRedTicks = 120
-            turnDir = -turnDir; backupTicks = 30; mode = Mode.BACKUP
-        }
+        // First sight of red starts homing (but don't interrupt a backup — let it finish separating
+        // from whatever we just hit). Once in HOME, doHome owns the red / red-lost / arrival logic.
+        if (isRed(vision) && mode != Mode.HOME && mode != Mode.BACKUP) beginHome()
 
-        // Seeing red overrides everything else: line of sight is clear, so home straight in.
-        if (ignoreRedTicks == 0 && isRed(vision)) {
-            homingLostTicks = 0; mode = Mode.HOMING; driveHoming(); return
-        }
+        checkStuck()
 
         when (mode) {
-            Mode.CRUISE -> doCruise(sonar)
-            Mode.ORIENT -> doOrient()
-            Mode.AVOID  -> doAvoid(sonar)
-            Mode.BACKUP -> doBackup()
-            Mode.HOMING -> reacquire()   // lost the ball mid-approach
+            Mode.DRIVE    -> doDrive(sonar, hit)
+            Mode.AVOID    -> doAvoid(sonar, hit)
+            Mode.BACKUP   -> doBackup()
+            Mode.TURNAWAY -> doTurnAway()
+            Mode.SCAN     -> doScan()
+            Mode.HOME     -> doHome(hit)
+            Mode.DONE     -> {}
         }
     }
 
-    // ---- odometry ------------------------------------------------------------------------------
+    // ---- explore -------------------------------------------------------------------------------
 
-    /** Integrate the velocities we last commanded, matching model.Robot.step's kinematics. */
+    private fun beginDrive() {
+        mode = Mode.DRIVE
+    }
+
+    private fun doDrive(sonar: Double, hit: Boolean) {
+        if (hit) { beginBackup(turnAway); return }
+        if (sonar < avoidDist) { beginAvoid(); return }
+        if (hypot(odoX - scanRefX, odoY - scanRefY) > scanEvery) { beginScan(); return }
+        drive(cruise, cruise)
+    }
+
+    private fun beginAvoid() {
+        mode = Mode.AVOID
+        avoidDir = lessVisitedTurnDir()
+    }
+
+    private fun doAvoid(sonar: Double, hit: Boolean) {
+        if (hit) { beginBackup(turnAway); return }
+        if (sonar > clearDist) { beginDrive(); return }
+        // Arc away (slow forward + turn) toward the less-visited side until the path opens up.
+        val s = spin * avoidDir
+        drive(cruise * 0.25 - s, cruise * 0.25 + s)
+    }
+
+    /** Recovery is two phases: reverse to physically separate from what we hit, then turn away from it. */
+    private fun beginBackup(turnAmount: Double, dur: Double = backupTime) {
+        mode = Mode.BACKUP
+        backupSecs = 0.0
+        pendingTurn = turnAmount
+        backupDur = dur
+    }
+
+    private fun doBackup() {
+        drive(-cruise * 0.5, -cruise * 0.5)   // reverse to unpin (translation away from the obstacle)
+        backupSecs += lastDt
+        if (backupSecs >= backupDur) {
+            turnTarget = odoHeading + pendingTurn * lessVisitedTurnDir()
+            mode = Mode.TURNAWAY
+        }
+    }
+
+    private fun doTurnAway() {
+        val diff = angleDiff(turnTarget, odoHeading)
+        if (abs(diff) < 0.12) { beginDrive(); return }   // fixed target, so this always completes
+        if (diff > 0) drive(-spin, spin) else drive(spin, -spin)
+    }
+
+    private fun beginScan() {
+        mode = Mode.SCAN
+        scanSweep = 0.0
+        prevHeading = odoHeading
+        scanRefX = odoX; scanRefY = odoY
+    }
+
+    private fun doScan() {
+        scanSweep += abs(angleDiff(odoHeading, prevHeading))
+        prevHeading = odoHeading
+        if (scanSweep >= 2 * Math.PI) { beginDrive(); return }
+        drive(spin, -spin)   // rotate one direction, sweeping the vision ray all the way round
+    }
+
+    /** Time-based escape: if we make no net progress for a while, force a big turn-away to break out. */
+    private fun checkStuck() {
+        if (mode == Mode.HOME || mode == Mode.SCAN) { stuckRefX = odoX; stuckRefY = odoY; stuckSecs = 0.0; return }
+        if (hypot(odoX - stuckRefX, odoY - stuckRefY) > 55.0) {
+            stuckRefX = odoX; stuckRefY = odoY; stuckSecs = 0.0
+        } else {
+            stuckSecs += lastDt
+            if (stuckSecs >= stuckTime) {   // no real progress for a while → reverse well clear and change tack
+                stuckSecs = 0.0
+                beginBackup(bigTurn, dur = 0.7)
+            }
+        }
+    }
+
+    // ---- home in on the ball -------------------------------------------------------------------
+
+    private fun beginHome() {
+        mode = Mode.HOME
+        redDist = 0.0; homeLost = 0
+        homePrevX = odoX; homePrevY = odoY
+    }
+
+    private fun doHome(hit: Boolean) {
+        val red = isRed(api.sensors.vision.reading ?: Color.TRANSPARENT)
+
+        // A collision after we've closed a good distance on the ball means we've arrived (the ball sits
+        // in the corner, so we bump the walls right at it). Otherwise it's an obstacle in the way.
+        if (hit) {
+            if (redDist >= arriveDist) { mode = Mode.DONE; drive(0.0, 0.0); return }
+            beginBackup(turnAway); return
+        }
+        if (red) {
+            homeLost = 0
+            redDist += hypot(odoX - homePrevX, odoY - homePrevY)   // distance closed while locked on
+            homePrevX = odoX; homePrevY = odoY
+            drive(cruise, cruise)   // clear sight line — drive straight at the ball
+            return
+        }
+        // Red just dropped. If we'd closed a long distance locked on, we drove straight through the
+        // (non-solid) ball — i.e. touched it — so stop. A short lock means it was a distant glimpse
+        // that an obstacle occluded; turn to reacquire, or give up to exploring if it stays lost.
+        if (redDist >= arriveDist) { mode = Mode.DONE; drive(0.0, 0.0); return }
+        redDist = 0.0
+        if (++homeLost > 55) { beginDrive(); return }
+        drive(-spin * 0.5, spin * 0.5)
+    }
+
+    // ---- odometry & coverage -------------------------------------------------------------------
+
+    /** Integrate the commanded velocities, matching model.Robot.step's kinematics. */
     private fun updateOdometry() {
-        // Compute dt exactly as model.Robot does (wall clock, capped at 0.033) so the estimate tracks
-        // the simulator at any frame rate.
-        val now = clockNanos()
-        lastDt = if (lastClock < 0L) 0.0 else ((now - lastClock) / 1e9).coerceAtMost(0.033)
-        lastClock = now
+        lastDt = dtPerTick   // the sim advances in fixed steps, so every react is exactly one step
 
         val l = api.actuator.leftTrackVelocity
         val r = api.actuator.rightTrackVelocity
         val v = (l + r) / 2.0
         val omega = (r - l) / trackWidth
-        val moveHeading = odoHeading           // translation uses the pre-turn heading, as the sim does
+        val moveHeading = odoHeading
         odoHeading += omega * lastDt
         if (api.sensors.collision.reading != true) {
             odoX += v * cos(moveHeading) * lastDt
@@ -158,96 +268,23 @@ class BallFinderProgram(
         visited[key] = (visited[key] ?: 0) + 1
     }
 
+    /** Turn toward whichever side (left/right of current heading) leads into less-visited ground. */
+    private fun lessVisitedTurnDir(): Double {
+        val right = visitsAt(odoHeading + 1.2)
+        val left  = visitsAt(odoHeading - 1.2)
+        return if (right <= left) 1.0 else -1.0
+    }
+
+    private fun visitsAt(heading: Double): Int {
+        val x = odoX + cos(heading) * cellSize * 1.6
+        val y = odoY + sin(heading) * cellSize * 1.6
+        return visited[cellKey(x, y)] ?: 0
+    }
+
     private fun cellKey(x: Double, y: Double): Long {
         val cx = floor(x / cellSize).toInt()
         val cy = floor(y / cellSize).toInt()
         return (cx.toLong() shl 32) or (cy.toLong() and 0xffffffffL)
-    }
-
-    private fun visitsAt(heading: Double, dist: Double): Int =
-        visited[cellKey(odoX + cos(heading) * dist, odoY + sin(heading) * dist)] ?: 0
-
-    // ---- explore: cruise, avoid, recover -------------------------------------------------------
-
-    private fun doCruise(sonar: Double) {
-        if (api.sensors.collision.reading == true) { backupTicks = 15; mode = Mode.BACKUP; return }
-        // Periodically steer toward the least-visited direction so exploration progresses into fresh
-        // ground instead of drifting back over old ground.
-        if (++cruiseTicks > reorientEvery) {
-            cruiseTicks = 0
-            targetHeading = bestExploreHeading()
-            mode = Mode.ORIENT
-            return
-        }
-        if (sonar < avoidDist) {
-            // Turn toward whichever side leads into less-visited territory (odometry-based, no extra
-            // sensing) so avoidance doubles as exploration.
-            val right = visitsAt(odoHeading + 1.0, 150.0)   // +heading = clockwise on screen
-            val left  = visitsAt(odoHeading - 1.0, 150.0)
-            turnDir = if (right <= left) 1.0 else -1.0
-            avoidTicks = 0
-            mode = Mode.AVOID
-            return
-        }
-        // Weave while cruising: the differential term cancels in the average (forward speed is
-        // unchanged) but swings the heading ±~30°, sweeping the forward vision ray so it catches the
-        // ball even when the robot passes to one side of it.
-        cruisePhase += lastDt
-        val w = 24.0 * sin(cruisePhase * 3.0)
-        drive(cruiseSpeed - w, cruiseSpeed + w)
-    }
-
-    /** Least-visited compass direction, sampling the odometry grid a short way out along each. */
-    private fun bestExploreHeading(): Double {
-        var best = odoHeading
-        var bestVisits = Int.MAX_VALUE
-        val dirs = 12
-        for (i in 0 until dirs) {
-            val h = i * (2 * Math.PI / dirs)
-            val v = visitsAt(h, 120.0) + visitsAt(h, 240.0)
-            if (v < bestVisits) { bestVisits = v; best = h }
-        }
-        return best
-    }
-
-    private fun doOrient() {
-        if (api.sensors.collision.reading == true) { backupTicks = 15; mode = Mode.BACKUP; return }
-        val diff = normalize(targetHeading - odoHeading)
-        if (abs(diff) < 0.15) { mode = Mode.CRUISE; return }
-        if (diff > 0) drive(-spinSpeed, spinSpeed) else drive(spinSpeed, -spinSpeed)
-    }
-
-    private fun doAvoid(sonar: Double) {
-        if (api.sensors.collision.reading == true) { backupTicks = 15; mode = Mode.BACKUP; return }
-        // Turned a long way and still boxed in — back out and try the other way.
-        if (++avoidTicks > 130) { turnDir = -turnDir; backupTicks = 15; mode = Mode.BACKUP; return }
-        if (sonar > clearDist) { mode = Mode.CRUISE; return }
-        // +turnDir spins heading up (right on screen): right track leads.
-        if (turnDir > 0) drive(-spinSpeed, spinSpeed) else drive(spinSpeed, -spinSpeed)
-    }
-
-    private fun doBackup() {
-        // Reverse while curving in the current turn direction, opening a new heading to cruise on.
-        if (turnDir > 0) drive(-cruiseSpeed * 0.6, -cruiseSpeed * 0.35)
-        else drive(-cruiseSpeed * 0.35, -cruiseSpeed * 0.6)
-        if (--backupTicks <= 0) mode = Mode.CRUISE
-    }
-
-    // ---- home in on the ball -------------------------------------------------------------------
-
-    private fun driveHoming() {
-        // Line of sight to the ball is clear, so drive straight at it. A collision means the body
-        // clipped an obstacle corner beside the path; reverse *while turning* to re-approach at a new
-        // angle. If it truly can't get through, stuck detection escalates. The simulator ends the run
-        // once the ball is touched.
-        if (api.sensors.collision.reading == true) drive(-cruiseSpeed * 0.6, -cruiseSpeed * 0.3)
-        else drive(cruiseSpeed, cruiseSpeed)
-    }
-
-    /** Ball slipped out of the vision ray mid-approach: turn to re-find it, then fall back to cruise. */
-    private fun reacquire() {
-        if (++homingLostTicks > 40) { homingLostTicks = 0; mode = Mode.CRUISE; return }
-        drive(-spinSpeed * 0.5, spinSpeed * 0.5)
     }
 
     // ---- helpers -------------------------------------------------------------------------------
@@ -256,5 +293,9 @@ class BallFinderProgram(
 
     private fun isRed(c: Color) = c.red > 0.55 && c.green < 0.35 && c.blue < 0.35
 
-    private fun normalize(a: Double) = atan2(sin(a), cos(a))
+    /** Signed angle of [target] relative to [from], in (-π, π]. */
+    private fun angleDiff(target: Double, from: Double): Double {
+        val d = target - from
+        return atan2(sin(d), cos(d))
+    }
 }

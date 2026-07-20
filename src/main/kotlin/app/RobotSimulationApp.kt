@@ -40,6 +40,12 @@ class RobotSimulationApp : Application() {
     private lateinit var canvas: SimulationCanvas
 
     private var lastNanos = -1L
+    private var accumulator = 0.0
+
+    companion object {
+        /** The simulation's fixed physics timestep (60 Hz). */
+        const val FIXED_DT = 1.0 / 60.0
+    }
 
     override fun start(stage: Stage) {
         val registry = DefaultProgramRegistry()
@@ -70,12 +76,18 @@ class RobotSimulationApp : Application() {
 
         object : AnimationTimer() {
             override fun handle(now: Long) {
-                val dt = if (lastNanos < 0) 0.0 else ((now - lastNanos) / 1_000_000_000.0).coerceAtMost(0.033)
+                // Fixed-timestep loop ("fix your timestep"): advance the simulation in constant [FIXED_DT]
+                // increments regardless of the display's refresh rate. This keeps the physics — and so
+                // every autonomous program's control loop — deterministic and frame-rate independent,
+                // which is what lets the programs behave the same on any machine.
+                val elapsed = if (lastNanos < 0) 0.0 else (now - lastNanos) / 1_000_000_000.0
                 lastNanos = now
-                if (dt > 0.0) {
+                accumulator = (accumulator + elapsed).coerceAtMost(0.25)  // clamp to avoid a spiral of death
+                while (accumulator >= FIXED_DT) {
                     // A running program reacts through its sensor subscriptions, which fire from
-                    // simulation.step -> robot.updateSensors below. No explicit program tick needed.
-                    simulation.step(dt)
+                    // simulation.step -> robot.updateSensors. No explicit program tick needed.
+                    simulation.step(FIXED_DT)
+                    accumulator -= FIXED_DT
                 }
                 canvas.render()
             }
