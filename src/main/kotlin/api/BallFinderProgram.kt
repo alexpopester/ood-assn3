@@ -29,8 +29,10 @@ import observer.Observer
  *     a long "locked-on" run of red frames means we closed the distance and drove through it (touched
  *     it) when red finally drops — so we stop.
  *
- * All thresholds are physical (distance / angle / time), never tick counts. It clocks off the
- * collision sensor — the last sensor updated each tick — so sonar, vision and collision are all fresh.
+ * All thresholds are physical (distance / angle / time), never tick counts. It subscribes to the
+ * vision, sonar and collision sensors, caching each reading in a field as its observer fires, and
+ * runs its control step off the collision callback — the last sensor updated each tick — so vision
+ * and sonar are already refreshed when it reacts. The behaviour reads only those cached fields.
  * A light dead-reckoning [odometry] estimate backs the "less visited" bias and the arrival test; it
  * advances by [dtPerTick], the simulation's fixed timestep (the app runs a fixed-timestep loop, so
  * every react corresponds to exactly one physics step of this size — no wall-clock guessing needed).
@@ -87,7 +89,15 @@ class BallFinderProgram(
     private var stuckRefY = 0.0
     private var stuckSecs = 0.0
 
-    private lateinit var clockObs: Observer<Boolean>
+    // Latest sensor state, kept up to date by the observer callbacks below rather than polled from the
+    // sensor objects. The behaviour in react()/doHome()/updateOdometry() reads only these fields.
+    private var visionColor: Color = Color.TRANSPARENT
+    private var sonarDist: Double = Double.MAX_VALUE
+    private var collided: Boolean = false
+
+    private lateinit var visionObs: Observer<Color>
+    private lateinit var sonarObs: Observer<Double>
+    private lateinit var collisionObs: Observer<Boolean>
     private lateinit var api: RobotApi
 
     override fun startProgram(robot: RobotApi) {
@@ -97,15 +107,24 @@ class BallFinderProgram(
         scanRefX = 0.0; scanRefY = 0.0
         redDist = 0.0; homeLost = 0
         stuckRefX = 0.0; stuckRefY = 0.0; stuckSecs = 0.0
+        visionColor = Color.TRANSPARENT; sonarDist = Double.MAX_VALUE; collided = false
         beginScan()   // look around once before setting off
 
-        // Clock off collision — the last sensor updated each tick — so sonar & vision are already fresh.
-        clockObs = Observer { react() }
-        robot.sensors.collision.subscribe(clockObs)
+        // Subscribe to every sensor the behaviour depends on, caching each reading as it arrives.
+        // Collision is the last sensor updated each tick, so reacting on it runs react() exactly once
+        // per tick with vision and sonar already refreshed into their fields.
+        visionObs = Observer { visionColor = it }
+        sonarObs = Observer { sonarDist = it }
+        collisionObs = Observer { collided = it; react() }
+        robot.sensors.vision.subscribe(visionObs)
+        robot.sensors.sonar.subscribe(sonarObs)
+        robot.sensors.collision.subscribe(collisionObs)
     }
 
     override fun stopProgram(robot: RobotApi) {
-        robot.sensors.collision.unsubscribe(clockObs)
+        robot.sensors.vision.unsubscribe(visionObs)
+        robot.sensors.sonar.unsubscribe(sonarObs)
+        robot.sensors.collision.unsubscribe(collisionObs)
         robot.perform(SetVelocityCommand(robot.actuator, 0.0, 0.0))
     }
 
@@ -114,9 +133,9 @@ class BallFinderProgram(
         updateOdometry()
         markVisited()
 
-        val vision = api.sensors.vision.reading ?: Color.TRANSPARENT
-        val sonar  = api.sensors.sonar.reading ?: Double.MAX_VALUE
-        val hit    = api.sensors.collision.reading == true
+        val vision = visionColor
+        val sonar  = sonarDist
+        val hit    = collided
 
         // First sight of red starts homing (but don't interrupt a backup — let it finish separating
         // from whatever we just hit). Once in HOME, doHome owns the red / red-lost / arrival logic.
@@ -221,7 +240,7 @@ class BallFinderProgram(
     }
 
     private fun doHome(hit: Boolean) {
-        val red = isRed(api.sensors.vision.reading ?: Color.TRANSPARENT)
+        val red = isRed(visionColor)
 
         // A collision after we've closed a good distance on the ball means we've arrived (the ball sits
         // in the corner, so we bump the walls right at it). Otherwise it's an obstacle in the way.
@@ -257,7 +276,7 @@ class BallFinderProgram(
         val omega = (r - l) / trackWidth
         val moveHeading = odoHeading
         odoHeading += omega * lastDt
-        if (api.sensors.collision.reading != true) {
+        if (!collided) {
             odoX += v * cos(moveHeading) * lastDt
             odoY += v * sin(moveHeading) * lastDt
         }

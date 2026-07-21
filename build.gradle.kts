@@ -2,6 +2,7 @@ plugins {
     kotlin("jvm") version "2.3.20"
     application
     id("org.openjfx.javafxplugin") version "0.1.0"
+    id("org.jetbrains.kotlinx.kover") version "0.9.1"
 }
 
 group = "org.example"

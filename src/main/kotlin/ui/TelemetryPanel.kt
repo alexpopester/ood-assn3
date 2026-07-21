@@ -3,8 +3,10 @@ package ui
 import javafx.geometry.Insets
 import javafx.scene.control.Label
 import javafx.scene.layout.VBox
+import javafx.scene.paint.Color
 import model.Robot
 import observer.LabelObserver
+import observer.Observer
 
 /**
  * A live readout of the sensor values — the *consumer* side of the Observer pattern.
@@ -21,6 +23,29 @@ class TelemetryPanel : VBox(6.0) {
     private val line = valueLabel()
     private val collision = valueLabel()
 
+    // The three line sensors share one label, so their observers share this cached state.
+    private var lineL = false
+    private var lineC = false
+    private var lineR = false
+    private fun updateLine() {
+        val fmt = { v: Boolean -> if (v) "■" else "□" }
+        line.text = "${fmt(lineL)} ${fmt(lineC)} ${fmt(lineR)}"
+    }
+
+    // Every observer is stored as a field (not created inline) so that bindTo can unsubscribe the
+    // previous robot's subscriptions before subscribing to a new one — no lingering subscriptions on
+    // discarded robots, and a clean teardown path via [unbind].
+    private val sonarObs = LabelObserver<Double>(sonar) { "%.1f".format(it) }
+    private val temperatureObs = LabelObserver<Double>(temperature) { "%.1f°".format(it) }
+    private val visionObs = LabelObserver<Color>(vision) { it.toString() }
+    private val collisionObs = LabelObserver<Boolean>(collision) { if (it) "HIT" else "—" }
+    private val lineLeftObs = Observer<Boolean> { lineL = it; updateLine() }
+    private val lineCenterObs = Observer<Boolean> { lineC = it; updateLine() }
+    private val lineRightObs = Observer<Boolean> { lineR = it; updateLine() }
+
+    /** The robot we are currently subscribed to, so [bindTo]/[unbind] can detach cleanly. */
+    private var bound: Robot? = null
+
     init {
         padding = Insets(12.0)
         prefWidth = 210.0
@@ -36,30 +61,37 @@ class TelemetryPanel : VBox(6.0) {
     }
 
     /**
-     * Subscribe observers to the given robot's sensors so the labels update live. Called whenever
-     * the robot is (re)created — on startup, environment change, and reset.
+     * Subscribe our observers to the given robot's sensors so the labels update live. Called whenever
+     * the robot is (re)created — on startup, environment change, and reset. Any previous robot is
+     * [unbind]ed first, so subscriptions never accumulate on discarded robots.
      *
-     * TODO(student): subscribe an observer to each sensor and update the matching label, e.g.:
-     * You can change the text of one of the Labels above by modifying the `text` property,
-     * e.g: `vision.text = "The new text to display"`
-     *
-     * The labels (`sonar`, `temperature`, `vision`, `line`, `collision`) are ready to write to.
-     * Until you do this, they stay "—". (This depends on your Observer pattern working — see
-     * AbstractSubject.)
+     * All observers are stored as fields (including the three line-sensor observers), which is what
+     * makes clean unsubscription possible.
      */
     fun bindTo(robot: Robot) {
-        robot.sonar.subscribe(LabelObserver(sonar) { "%.1f".format(it) })
-        robot.temperature.subscribe(LabelObserver(temperature) { "%.1f°".format(it) })
-        robot.vision.subscribe(LabelObserver(vision) { it.toString() })
-        robot.collision.subscribe(LabelObserver(collision) { if (it) "HIT" else "—" })
+        unbind()
+        robot.sonar.subscribe(sonarObs)
+        robot.temperature.subscribe(temperatureObs)
+        robot.vision.subscribe(visionObs)
+        robot.collision.subscribe(collisionObs)
+        // The three line sensors are combined into one label (L / C / R).
+        robot.lineLeft.subscribe(lineLeftObs)
+        robot.lineCenter.subscribe(lineCenterObs)
+        robot.lineRight.subscribe(lineRightObs)
+        bound = robot
+    }
 
-        // Combine the three line sensors into one label (L / C / R)
-        var l = false; var c = false; var r = false
-        val fmt = { v: Boolean -> if (v) "■" else "□" }
-        val updateLine = { line.text = "${fmt(l)} ${fmt(c)} ${fmt(r)}" }
-        robot.lineLeft.subscribe   { l = it; updateLine() }
-        robot.lineCenter.subscribe { c = it; updateLine() }
-        robot.lineRight.subscribe  { r = it; updateLine() }
+    /** Detach every observer from the currently bound robot's sensors. Safe to call when unbound. */
+    fun unbind() {
+        val robot = bound ?: return
+        robot.sonar.unsubscribe(sonarObs)
+        robot.temperature.unsubscribe(temperatureObs)
+        robot.vision.unsubscribe(visionObs)
+        robot.collision.unsubscribe(collisionObs)
+        robot.lineLeft.unsubscribe(lineLeftObs)
+        robot.lineCenter.unsubscribe(lineCenterObs)
+        robot.lineRight.unsubscribe(lineRightObs)
+        bound = null
     }
 
     private fun captioned(caption: String, value: Label): VBox =
